@@ -152,14 +152,6 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
         // we listen for the Flow dedicated Stepper to drive the internal "steps" PublishSubject<StepContext>
         self.stepper
             .steps
-            .do(onNext: { [weak self] step in
-                // Ensure popped step is handled even if flow is no longer visible
-                if step is PoppedStep {
-                    let newStepContext = StepContext(with: step)
-                    newStepContext.withinFlow = self?.flow
-                    self?.steps.onNext(newStepContext)
-                }
-            })
             .pausable(afterCount: 1, withPauser: self.flow.rxVisible)
             .asDriver(onErrorJustReturn: NoneStep())
             .drive(onNext: { [weak self] (step) in
@@ -171,7 +163,10 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
 
         // we listen for the Flow root dismissal state. In case of a dismiss
         // the FlowCoordinate should be ended (its reference has to be unretain from the main Coordinator)
-        self.flow.rxDismissed.subscribe(onSuccess: { [weak self] in
+        Observable.merge(self.flow.rxDismissed.asObservable(),
+                         self.flow.rxPopped.asObservable())
+                        .take(1)
+                        .subscribe(onCompleted: { [weak self] in
             // there is a risk that "self" is already deallocated as it could have
             // been unretained by the main Coordinator (after the self.delegate.endFlowCoordinator(withIdentifier: self.identifier)
             // statement in the subscription chain
@@ -201,7 +196,7 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
             stepper
                 .steps
                 .pausable(withPauser: presentable.rxVisible)
-                .takeUntil(self.flow.rxDismissed.asObservable())
+                .takeUntil(Observable.merge(self.flow.rxDismissed.asObservable(), self.flow.rxPopped.asObservable()))
                 .asDriver(onErrorJustReturn: NoneStep()).drive(onNext: { [weak self] (step) in
                     // the nextPresentable's Stepper fires a new Step
                     let newStepContext = StepContext(with: step)
