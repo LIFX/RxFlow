@@ -40,4 +40,11 @@ extension Reactive where Base: UIViewController {
         // futur calls to viewDidAppear and viewWillDisappear will chage the displayable state
         return initialState.concat(Observable<Bool>.merge(viewDidAppearObservable, viewWillDisappearObservable))
     }
+    
+    public var popped: Observable<Void> {
+        return self.sentMessage(#selector(Base.viewDidDisappear))
+            .filter { _ in self.base.isMovingFromParentViewController }
+            .map { _ in return Void() }
+            .take(1)
+    }
 }

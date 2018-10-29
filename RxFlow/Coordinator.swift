@@ -152,6 +152,14 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
         // we listen for the Flow dedicated Stepper to drive the internal "steps" PublishSubject<StepContext>
         self.stepper
             .steps
+            .do(onNext: { [weak self] step in
+                // Ensure popped step is handled even if flow is no longer visible
+                if step is PoppedStep {
+                    let newStepContext = StepContext(with: step)
+                    newStepContext.withinFlow = self?.flow
+                    self?.steps.onNext(newStepContext)
+                }
+            })
             .pausable(afterCount: 1, withPauser: self.flow.rxVisible)
             .asDriver(onErrorJustReturn: NoneStep())
             .drive(onNext: { [weak self] (step) in
