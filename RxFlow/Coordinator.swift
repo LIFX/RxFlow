@@ -326,6 +326,24 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
             end(flowCoordinator: flow) // Root
         }
     }
+    
+    /// Prints out information about the current Flow hierarchy. Useful for debugging.
+    public func printHierarchy() {
+        if let root = rootFlow {
+            print("RxFlow:")
+            printFlow(root, indent: "  ")
+        }
+    }
+    
+    private func printFlow(_ flow: FlowCoordinator, indent: String) {
+        print("\(indent) Flow: \(type(of: flow.flow))")
+        if flow.childFlowCoordinators.count > 0 {
+            print("\(indent) Children: ")
+            flow.childFlowCoordinators.forEach { child in
+                printFlow(child, indent: "\(indent)  ")
+            }
+        }
+    }
 }
 
 // MARK: FlowCoordinatorDelegate implementation
