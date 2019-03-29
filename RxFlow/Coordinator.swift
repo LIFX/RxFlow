@@ -21,6 +21,12 @@ protocol FlowCoordinatorDelegate: class {
     /// - Parameters:
     ///   - stepContext: the StepContext that is being navigated to
     func willNavigate(to stepContext: StepContext)
+    
+    /// Used to determine if Flow/Step should be handled (used for stopping handling when step requires auth).
+    ///
+    /// - Parameters:
+    ///   - stepContext: the StepContext to be assessed for handling.
+    func shouldNavigate(to stepContext: StepContext) -> Bool
 
     /// Used to trigger the delegate after the Flow/Step is handled
     ///
@@ -44,6 +50,12 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
     /// The Stepper that drives the Flow
     /// It will trigger some Steps at the Flow level
     let stepper: Stepper
+    
+    enum HistoryContext {
+        case current, child(Flow), children([Flow])
+    }
+    
+    private(set) var history: [(Step, HistoryContext)] = []
 
     /// The Rx subject that holds all the Steps trigerred either by the Flow's Stepper
     /// or by the Steppers produced by the Flow.navigate(to:) function
@@ -78,6 +90,12 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
     func coordinate () {
 
         self.steps
+            .flatMap { [unowned self] stepContext -> Observable<StepContext> in
+                if self.delegate.shouldNavigate(to: stepContext) {
+                    return .just(stepContext)
+                }
+                return .empty()
+            }
             .do(onNext: { [unowned self] (stepContext) in
                 // trigger the delegate before the navigation is done
                 self.delegate.willNavigate(to: stepContext)
@@ -86,13 +104,34 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
                 // do the navigation according to the Flow and the Step
                 // Retrieve the NextFlowItems
                 return (stepContext, self.flow.navigate(to: stepContext.step))
-            }.do(onNext: { [unowned self] (stepContext, _) in
+            }.do(onNext: { [unowned self] (stepContext, nextFlowItems) in
                 // when first presentable is discovered we can assume the Flow is ready to be used (its root can be used in other Flows)
                 self.flow.flowReadySubject.onNext(true)
 
                 // trigger the delegate after the navigation is done
                 // the step will be handle whithin the Flow that is concerned by this very FlowCoordinator
                 stepContext.withinFlow = self.flow
+                
+                switch nextFlowItems {
+                case .one(let flowItem):
+                    if let childFlow = flowItem.nextPresentable as? Flow {
+                        self.history.append((stepContext.step, .child(childFlow)))
+                    } else {
+                        self.history.append((stepContext.step, .current))
+                    }
+                case .multiple(flowItems: let flowItems):
+                    let childFlows = flowItems.compactMap { $0.nextPresentable as? Flow }
+                    if childFlows.count > 0 {
+                        // There is at least one child flow, so as soon as that child flow
+                        // ends, it should be removed from the history.
+                        self.history.append((stepContext.step, .children(childFlows)))
+                    } else {
+                        self.history.append((stepContext.step, .current))
+                    }
+                case .none, .end, .triggerParentFlow:
+                    self.history.append((stepContext.step, .current))
+                }
+                
                 self.delegate.didNavigate(to: stepContext)
             }).map { [unowned self] (stepContext, nextFlowItems) -> (StepContext, [NextFlowItem]) in
                 switch nextFlowItems {
@@ -212,7 +251,19 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
     // MARK: FlowCoordinatorDelegate
     
     func end(flowCoordinator: FlowCoordinator) {
+        // Remove related history items
+        history = history.filter { item in
+            switch item.1 {
+            case .child(let child) where child === flowCoordinator.flow:
+                return false
+            case .children(let children) where children.contains(where: { $0 === flowCoordinator.flow}):
+                return false
+            default:
+                return true
+            }
+        }
         childFlowCoordinators = childFlowCoordinators.filter { $0 !== flowCoordinator }
+        delegate.end(flowCoordinator: flowCoordinator)
     }
 
     func willNavigate(to stepContext: StepContext) {
@@ -224,6 +275,11 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
         // Just pass up the hierarchy
         delegate.didNavigate(to: stepContext)
     }
+    
+    func shouldNavigate(to stepContext: StepContext) -> Bool {
+        // Just pass up the hierarchy
+        return delegate.shouldNavigate(to: stepContext)
+    }
 }
 
 /// The only purpose of a Coordinator is to handle the navigation that is
@@ -231,11 +287,17 @@ class FlowCoordinator: HasDisposeBag, FlowCoordinatorDelegate {
 final public class Coordinator: HasDisposeBag, Synchronizable {
 
     private var rootFlow: FlowCoordinator?
+    private var authenticationStep: Step?
     fileprivate let willNavigateSubject = PublishSubject<(Flow, Step)>()
     fileprivate let didNavigateSubject = PublishSubject<(Flow, Step)>()
+    
+    private let authProvider: AuthenticationStateProvider
+    private var pendingSteps: [Step]?
+    private var waitingOnAuth = false
 
     /// Initialize the Coordinator
-    public init() {
+    public init(authProvider: AuthenticationStateProvider = OptimisticAuthProvider()) {
+        self.authProvider = authProvider
     }
     
     // MARK: Coordinate flow
@@ -245,10 +307,12 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
     /// - Parameters:
     ///   - flow: The Flow to coordinate
     ///   - stepper: The Flow's Stepper companion that will determine the first navigation Steps for instance
-    public func coordinate(flow: Flow, withStepper stepper: Stepper) {
+    ///   - authStep: Defines Flow's default step for performing user authentication
+    public func coordinate(flow: Flow, withStepper stepper: Stepper, authStep: Step? = nil) {
         if let existingFlow = rootFlow {
             cleanUpHierarchy(flow: existingFlow)
         }
+        self.authenticationStep = authStep
         rootFlow = self.coordinate(rootFlow: flow, withStepper: stepper)
     }
 
@@ -259,7 +323,6 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
     ///   - stepper: The Flow's Stepper companion that will determine the first navigation Steps for instance
     ///   - parentFlowCoordinator: The parent FlowCoordinator. The parent is warned in case of a noNavigation NextFlowItem in its children
     func coordinate(rootFlow: Flow, withStepper stepper: Stepper) -> FlowCoordinator {
-
         // a new FlowCoordinator will handle this Flow navigation
         let flowCoordinator = FlowCoordinator(for: rootFlow,
                                               withStepper: stepper,
@@ -281,6 +344,14 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
     /// - Parameter steps: Series of steps to applied, starting with the root flow
     public func navigate(to steps: [Step]) {
         guard let root = rootFlow else {
+            return
+        }
+        
+        let requiresAuth = steps.reduce(false, { $0 || $1.requiresAuthentication })
+        guard !requiresAuth || authProvider.isAuthenticated else {
+            // Need to do auth flow before steps
+            pendingSteps = steps
+            doAuthentication()
             return
         }
         
@@ -316,6 +387,14 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
         }
     }
     
+    private func doAuthentication() {
+        guard let authStep = authenticationStep, let root = rootFlow else {
+            fatalError("Steps require authentication, but no auth step provided!")
+        }
+        waitingOnAuth = true
+        _ = navigateTo(step: authStep, currentFlow: root)
+    }
+    
     /// Cleans up existing hierarchy up to and including this flow. This ensures all child flows are ended.
     ///
     /// - Parameter flow: Flow to be cleaned up
@@ -332,6 +411,23 @@ final public class Coordinator: HasDisposeBag, Synchronizable {
         if let root = rootFlow {
             print("RxFlow:")
             printFlow(root, indent: "  ")
+        }
+    }
+    
+    public func printHistory() {
+        if let root = rootFlow {
+            print("RxFlow:")
+            printHistoryOfFlow(root, indent: "  ")
+        }
+    }
+    
+    private func printHistoryOfFlow(_ flow: FlowCoordinator, indent: String) {
+        print("\(indent) History: \(type(of: flow.flow))")
+        flow.history.forEach { item in
+            print("\(indent)  \(item.0)")
+        }
+        flow.childFlowCoordinators.forEach {
+            printHistoryOfFlow($0, indent: "\(indent)  ")
         }
     }
     
@@ -354,6 +450,13 @@ extension Coordinator: FlowCoordinatorDelegate {
         if flowCoordinator === rootFlow {
             rootFlow = nil
         }
+
+        // Need to check if we just finished authentication
+        if let pending = pendingSteps, waitingOnAuth {
+            waitingOnAuth = false
+            pendingSteps = nil
+            navigate(to: pending)
+        }
     }
 
     func willNavigate(to stepContext: StepContext) {
@@ -368,6 +471,14 @@ extension Coordinator: FlowCoordinatorDelegate {
             !(stepContext.step is NoneStep) {
             self.didNavigateSubject.onNext((withinFlow, stepContext.step))
         }
+    }
+    
+    func shouldNavigate(to stepContext: StepContext) -> Bool {
+        if stepContext.step.requiresAuthentication && !authProvider.isAuthenticated {
+            doAuthentication()
+            return false
+        }
+        return true
     }
 }
 

@@ -24,7 +24,15 @@ final class StepContext {
 
 /// A Step describes a possible state of navigation inside a Flow
 public protocol Step {
+    var requiresAuthentication: Bool { get }
+}
+
+public extension Step {
+    var requiresAuthentication: Bool {
+        return true
+    }
 }
 
 struct NoneStep: Step {
+    let requiresAuthentication: Bool = false
 }
